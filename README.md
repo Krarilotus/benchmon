@@ -14,7 +14,7 @@ A small, always-on-top Windows window for monitoring this PC and your Windows or
 
 Hover over a disk for its name, read/write activity, occupied/total GiB, and free GiB. Small partitions retain their actual proportional width, so their details may be easiest to read on hover.
 
-CPU/RAM/GPU/I/O are sampled approximately every two seconds, plus the time spent collecting counters. Disk capacity is refreshed every 30 seconds. The graph retains 90 samples, approximately three minutes. Above 70%, filled bars and values smoothly darken within their own hue, reaching a 35% darker shade at 100%. There are no abrupt yellow/red color switches. Graph lines and labels keep their identifying base colors.
+CPU/RAM/GPU/I/O are sampled approximately every two seconds, plus the time spent collecting counters. Disk capacity is refreshed every 30 seconds. The graph retains 90 samples, approximately three minutes. Filled bars start darker, begin gradually brightening above 50%, and brighten much faster above 80% into intense versions of their own hue. There are no abrupt yellow/red color switches. Graph lines, labels and numeric values keep their identifying base colors for readability.
 
 **Disk I/O measures time busy, not a percentage of the drive's advertised MB/s.** Concurrent I/O can produce counters above 100%; display values are capped at 100%. Windows uses logical-volume performance counters; Linux uses per-device read/write milliseconds from `/proc/diskstats`. These are practical activity indicators, not a disk throughput benchmark.
 

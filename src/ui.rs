@@ -38,11 +38,33 @@ impl Metric {
     }
 
     fn color(self, value: f32) -> Color32 {
-        // Ease into a darker shade after 70%, preserving the metric's hue throughout.
-        let fullness = ((value - 70.0) / 30.0).clamp(0.0, 1.0);
-        let fade = fullness * fullness * (3.0 - 2.0 * fullness);
-        self.base().gamma_multiply(1.0 - 0.35 * fade)
+        let base = self.base();
+        if value <= 80.0 {
+            let fade = ((value - 50.0) / 30.0).clamp(0.0, 1.0);
+            base.gamma_multiply(0.55 + 0.20 * fade)
+        } else {
+            // Above 80%, brighten much faster while keeping the metric's own hue.
+            let fade = ((value - 80.0) / 20.0).clamp(0.0, 1.0);
+            blend(
+                base.gamma_multiply(0.75),
+                lighter(base),
+                1.0 - (1.0 - fade).powi(2),
+            )
+        }
     }
+}
+
+fn blend(from: Color32, to: Color32, amount: f32) -> Color32 {
+    let channel = |a: u8, b: u8| (a as f32 + (b as f32 - a as f32) * amount).round() as u8;
+    Color32::from_rgb(
+        channel(from.r(), to.r()),
+        channel(from.g(), to.g()),
+        channel(from.b(), to.b()),
+    )
+}
+
+fn lighter(color: Color32) -> Color32 {
+    blend(color, Color32::WHITE, 0.5)
 }
 
 const SEGMENTS: usize = 32;
@@ -65,8 +87,7 @@ fn paint_segments(p: &egui::Painter, rect: Rect, metric: Metric, value: f32, sca
     let width = (rect.width() - gap * (SEGMENTS - 1) as f32) / SEGMENTS as f32;
     let lit = lit_segments(value);
     let color = metric.color(value);
-    let lighter = |channel: u8| channel + (255 - channel) / 2;
-    let flash = Color32::from_rgb(lighter(color.r()), lighter(color.g()), lighter(color.b()));
+    let flash = lighter(color);
     for index in 0..SEGMENTS {
         let cell = Rect::from_min_size(
             Pos2::new(rect.left() + index as f32 * (width + gap), rect.top()),
@@ -111,7 +132,7 @@ pub fn bar(ui: &mut egui::Ui, metric: Metric, value: f32, detail: &str, t: f64) 
         Align2::RIGHT_CENTER,
         format!("{value:5.1}% {detail}"),
         mono,
-        metric.color(value),
+        metric.base(),
     );
 }
 
@@ -200,7 +221,7 @@ pub fn disks(ui: &mut egui::Ui, disks: &[Disk], t: f64) {
             if index > 0 {
                 painter.line_segment(
                     [track.left_top(), track.left_bottom()],
-                    Stroke::new(1.0, BG),
+                    Stroke::new(1.0_f32, BG),
                 );
             }
         }
@@ -210,7 +231,7 @@ pub fn disks(ui: &mut egui::Ui, disks: &[Disk], t: f64) {
     let mono = FontId::monospace(11.0);
     let busiest = crate::probe::busiest_disk(disks);
     let (io_text, io_color) = busiest.map_or(("n/a".into(), AMBER), |v| {
-        (format!("{v:5.1}%"), Metric::Disk.color(v))
+        (format!("{v:5.1}%"), Metric::Disk.base())
     });
     p.text(
         Pos2::new(rect.right(), rect.top() + 20.0),
@@ -240,7 +261,7 @@ pub fn disks(ui: &mut egui::Ui, disks: &[Disk], t: f64) {
         Align2::RIGHT_CENTER,
         format!("{percent:5.1}% {capacity}"),
         mono,
-        Metric::Disk.color(percent),
+        Metric::Disk.base(),
     );
 }
 
@@ -275,7 +296,12 @@ pub fn trace(ui: &mut egui::Ui, histories: &[VecDeque<Option<f32>>; 4]) {
     let (rect, _) =
         ui.allocate_exact_size(Vec2::new(ui.available_width(), 22.0), egui::Sense::hover());
     let p = ui.painter();
-    p.rect_stroke(rect, 0.0, Stroke::new(1.0, DIM), egui::StrokeKind::Inside);
+    p.rect_stroke(
+        rect,
+        0.0,
+        Stroke::new(1.0_f32, DIM),
+        egui::StrokeKind::Inside,
+    );
     let colors = [Metric::Cpu, Metric::Ram, Metric::Gpu, Metric::Disk].map(Metric::base);
     for (history, color) in histories.iter().zip(colors) {
         let step = rect.width() / (HISTORY - 1) as f32;
@@ -291,14 +317,14 @@ pub fn trace(ui: &mut egui::Ui, histories: &[VecDeque<Option<f32>>; 4]) {
                 if points.len() >= 2 {
                     p.add(Shape::line(
                         std::mem::take(&mut points),
-                        Stroke::new(1.2, color),
+                        Stroke::new(1.2_f32, color),
                     ));
                 }
                 points.clear();
             }
         }
         if points.len() >= 2 {
-            p.add(Shape::line(points, Stroke::new(1.2, color)));
+            p.add(Shape::line(points, Stroke::new(1.2_f32, color)));
         }
     }
 }
