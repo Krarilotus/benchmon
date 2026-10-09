@@ -19,6 +19,9 @@ jobs:
       - run: cargo fmt --check
       - run: cargo clippy --all-targets --locked -- -D warnings
       - run: cargo test --locked
+      - name: Windows collector counters and disconnect cleanup
+        shell: powershell
+        run: ./tools/test-windows-probe.ps1
       - name: Build portable package
         shell: powershell
         run: ./tools/package.ps1
