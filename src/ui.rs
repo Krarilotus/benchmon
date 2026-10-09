@@ -28,39 +28,20 @@ impl Metric {
         }
     }
 
-    fn palette(self) -> [Color32; 3] {
+    fn base(self) -> Color32 {
         match self {
-            Self::Cpu => [GREEN, AMBER, RED],
-            Self::Ram => [
-                Color32::from_rgb(180, 48, 62),
-                Color32::from_rgb(224, 72, 84),
-                Color32::from_rgb(255, 117, 135),
-            ],
-            Self::Gpu => [
-                Color32::from_rgb(255, 164, 58),
-                Color32::from_rgb(255, 201, 76),
-                Color32::from_rgb(255, 96, 32),
-            ],
-            Self::Disk => [
-                Color32::from_rgb(117, 209, 255),
-                Color32::from_rgb(69, 157, 255),
-                Color32::from_rgb(175, 125, 255),
-            ],
+            Self::Cpu => GREEN,
+            Self::Ram => Color32::from_rgb(180, 48, 62),
+            Self::Gpu => Color32::from_rgb(255, 164, 58),
+            Self::Disk => Color32::from_rgb(117, 209, 255),
         }
     }
 
-    fn base(self) -> Color32 {
-        self.palette()[0]
-    }
-
     fn color(self, value: f32) -> Color32 {
-        self.palette()[if value >= 90.0 {
-            2
-        } else if value >= 70.0 {
-            1
-        } else {
-            0
-        }]
+        // Ease into a darker shade after 70%, preserving the metric's hue throughout.
+        let fullness = ((value - 70.0) / 30.0).clamp(0.0, 1.0);
+        let fade = fullness * fullness * (3.0 - 2.0 * fullness);
+        self.base().gamma_multiply(1.0 - 0.35 * fade)
     }
 }
 
