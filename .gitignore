@@ -1,0 +1,20 @@
+# Machine-specific configuration, credentials, artifacts and local troubleshooting files.
+/hosts.txt
+*.local
+*.log
+*.exe
+*.pdb
+*.zip
+/target/
+/dist/
+/artifacts/
+/.ssh/
+/.env
+/.env.*
+*.pem
+*.key
+id_rsa*
+id_ed25519*
+__pycache__/
+*.pyc
+/.vscode/

@@ -1,0 +1,8 @@
+# Copy to hosts.txt beside benchmon.exe, then replace these examples with your own machines.
+# With no hosts.txt, benchmon monitors only the local Windows PC.
+This PC|local
+# Workstation|windows|my-windows-pc
+# Server|linux|my-linux-server
+# Alternatively, use a username and address:
+# Workstation|windows|Example User@windows.example.com
+# Server|linux|user@linux.example.com
