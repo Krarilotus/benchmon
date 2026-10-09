@@ -30,10 +30,13 @@ for ($attempt = 0; $attempt -lt 20; $attempt++) {
         Start-Sleep -Milliseconds 250
     }
 }
-foreach ($name in @('hosts.example.txt', 'README.md', 'LICENSE')) {
+foreach ($name in @('hosts.example.txt', 'README.md', 'LICENSE', 'assets/screenshot.jpg')) {
     $from = Join-Path $projectRoot $name
     $to = Join-Path $Destination $name
-    if ($from -ne $to) { Copy-Item -LiteralPath $from -Destination $to -Force }
+    if ($from -ne $to) {
+        New-Item -ItemType Directory -Path (Split-Path -Parent $to) -Force | Out-Null
+        Copy-Item -LiteralPath $from -Destination $to -Force
+    }
 }
 # Write the machine-specific destination only to an ignored local file.
 Set-Content -LiteralPath $locationFile -Value $Destination -Encoding UTF8

@@ -17,8 +17,20 @@ try {
     New-Item -ItemType Directory -Path $dist -Force | Out-Null
     $archive = Join-Path $dist "benchmon-$version-windows-x64.zip"
     # No directory traversal or configuration auto-discovery: hosts.txt is never packaged.
-    $publicFiles = @('target/release/benchmon.exe', 'hosts.example.txt', 'README.md', 'LICENSE')
-    Compress-Archive -LiteralPath $publicFiles -DestinationPath $archive -Force
+    Add-Type -AssemblyName System.IO.Compression, System.IO.Compression.FileSystem
+    $publicFiles = @{
+        'benchmon.exe' = 'target/release/benchmon.exe'
+        'hosts.example.txt' = 'hosts.example.txt'
+        'README.md' = 'README.md'
+        'LICENSE' = 'LICENSE'
+        'assets/screenshot.jpg' = 'assets/screenshot.jpg'
+    }
+    $zip = [IO.Compression.ZipArchive]::new([IO.File]::Create($archive), [IO.Compression.ZipArchiveMode]::Create)
+    try {
+        foreach ($entry in $publicFiles.GetEnumerator()) {
+            [IO.Compression.ZipFileExtensions]::CreateEntryFromFile($zip, $entry.Value, $entry.Key) | Out-Null
+        }
+    } finally { $zip.Dispose() }
     Get-FileHash -LiteralPath $archive -Algorithm SHA256 | Format-List
 } finally {
     $env:CARGO_ENCODED_RUSTFLAGS = $previousFlags

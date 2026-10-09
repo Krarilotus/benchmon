@@ -56,11 +56,7 @@ impl App {
             }
             Err(error) => config_error = Some(error),
         }
-        Self {
-            hosts,
-            children,
-            config_error,
-        }
+        Self { hosts, children, config_error }
     }
 
     fn host(ui: &mut egui::Ui, host: &mut Host, t: f64, dt: f32) {
@@ -93,14 +89,9 @@ impl App {
         for (shown, target) in host.shown.iter_mut().zip(values) {
             *shown += (target.unwrap_or(0.0) - *shown) * (1.0 - (-6.0 * dt).exp());
         }
-        let stale = sample
-            .as_ref()
-            .is_none_or(|(_, at)| at.elapsed() > Duration::from_secs(8));
-        let (state, color) = if stale {
-            (status.to_uppercase(), RED)
-        } else {
-            ("ONLINE".into(), GREEN)
-        };
+        let stale = sample.as_ref().is_none_or(|(_, at)| at.elapsed() > Duration::from_secs(8));
+        let (state, color) =
+            if stale { (status.to_uppercase(), RED) } else { ("ONLINE".into(), GREEN) };
         ui.horizontal(|ui| {
             ui.label(
                 egui::RichText::new(format!("[{}]", host.name))
@@ -109,11 +100,7 @@ impl App {
                     .strong(),
             );
             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                ui.label(
-                    egui::RichText::new(state)
-                        .font(FontId::monospace(10.0))
-                        .color(color),
-                );
+                ui.label(egui::RichText::new(state).font(FontId::monospace(10.0)).color(color));
             });
         });
         ui::bar(ui, ui::Metric::Cpu, host.shown[0], "", t);
@@ -121,13 +108,49 @@ impl App {
         if values[2].is_some() {
             ui::bar(ui, ui::Metric::Gpu, host.shown[2], &details[2], t + 0.66);
         }
-        ui::disks(
-            ui,
-            sample.as_ref().map_or(&[], |(s, _)| s.disks.as_slice()),
-            t,
-        );
+        ui::disks(ui, sample.as_ref().map_or(&[], |(s, _)| s.disks.as_slice()), t);
         ui::trace(ui, &host.history);
         ui.add_space(8.0);
+    }
+
+    /// Reuse the GUI's configuration, collectors and cleanup for one-sample diagnostics.
+    fn check(self) -> i32 {
+        if let Some(error) = &self.config_error {
+            println!("{}", serde_json::json!({"status": "error", "message": error}));
+            return 1;
+        }
+        let deadline = Instant::now() + Duration::from_secs(25);
+        let mut pending: Vec<_> = self.hosts.iter().collect();
+        let mut failed = false;
+        while !pending.is_empty() {
+            pending.retain(|host| {
+                let reading = host.shared.lock().unwrap();
+                if let Some((sample, _)) = &reading.latest {
+                    let ok = !sample.disks.is_empty();
+                    failed |= !ok;
+                    println!(
+                        "{}",
+                        serde_json::json!({"name": host.name,
+                        "status": if ok { "ok" } else { "error: no disk readings" },
+                        "sample": sample.as_ref()})
+                    );
+                } else if Instant::now() >= deadline {
+                    failed = true;
+                    println!(
+                        "{}",
+                        serde_json::json!({"name": host.name, "status": "error",
+                        "message": format!("No sample within 25s ({})", reading.status)})
+                    );
+                } else {
+                    return true;
+                }
+                false
+            });
+            if !pending.is_empty() {
+                std::thread::sleep(Duration::from_millis(100));
+            }
+        }
+        i32::from(failed)
     }
 }
 
@@ -154,6 +177,9 @@ impl eframe::App for App {
 
 fn main() -> eframe::Result {
     let app = App::new();
+    if std::env::args().any(|arg| arg == "--check") {
+        std::process::exit(app.check());
+    }
     let height = (20.0 + 155.0 * app.hosts.len() as f32).clamp(200.0, 900.0);
     let options = eframe::NativeOptions {
         viewport: egui::ViewportBuilder::default()

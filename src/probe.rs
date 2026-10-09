@@ -4,7 +4,7 @@
 //! nothing is installed on the machine. A probe that ends is restarted after ten
 //! seconds, and every probe process is killed when the app closes.
 
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use std::io::{BufRead, BufReader, Write};
 use std::process::{Child, Command, Stdio};
 use std::sync::{Arc, Mutex};
@@ -22,7 +22,7 @@ pub enum Target {
     Linux(String),
 }
 
-#[derive(Clone, Debug)]
+#[derive(Debug, Serialize)]
 pub struct Sample {
     pub cpu: f32,
     pub ram_used_gb: f32,
@@ -31,7 +31,7 @@ pub struct Sample {
     pub disks: Vec<Disk>,
 }
 
-#[derive(Clone, Debug, Deserialize)]
+#[derive(Debug, Deserialize, Serialize)]
 pub struct Disk {
     pub name: String,
     pub used_bytes: f64,
@@ -54,7 +54,7 @@ pub fn busiest_disk(disks: &[Disk]) -> Option<f32> {
     disks.iter().filter_map(Disk::busy).reduce(f32::max)
 }
 
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Copy, Debug, Serialize)]
 pub struct Gpu {
     pub util: f32,
     pub vram_used_gb: f32,
@@ -63,14 +63,13 @@ pub struct Gpu {
 
 #[derive(Default)]
 pub struct Reading {
-    pub latest: Option<(Sample, Instant)>,
+    pub latest: Option<(Arc<Sample>, Instant)>,
     pub status: String,
 }
 
 pub type Shared = Arc<Mutex<Reading>>;
 pub type Children = Arc<Mutex<Vec<Child>>>;
 
-const SSH: &str = "ssh";
 #[cfg(windows)]
 const NO_WINDOW: u32 = 0x0800_0000;
 
@@ -91,7 +90,7 @@ pub fn start(target: Target, shared: Shared, children: Children) {
                         let Ok(line) = line else { break };
                         if let Some(sample) = parse(&line) {
                             let mut r = shared.lock().unwrap();
-                            r.latest = Some((sample, Instant::now()));
+                            r.latest = Some((Arc::new(sample), Instant::now()));
                             r.status = "online".into();
                         }
                     }
@@ -122,39 +121,33 @@ fn set_status(shared: &Shared, status: &str) {
 
 fn spawn(target: &Target) -> std::io::Result<Child> {
     let encoded = encode_powershell(WINDOWS_PROBE);
-    let mut cmd = match target {
+    let mut cmd = Command::new(if matches!(target, Target::Local) { "powershell" } else { "ssh" });
+    match target {
         Target::Local => {
-            let mut c = Command::new("powershell");
-            c.args(["-NoProfile", "-NonInteractive", "-EncodedCommand", &encoded]);
-            c
+            cmd.args(["-NoProfile", "-NonInteractive", "-EncodedCommand", &encoded]);
         }
         Target::Windows(host) => {
-            let mut c = Command::new(SSH);
-            c.args(ssh_options()).arg(host);
-            c.arg(format!(
-                "powershell -NoProfile -NonInteractive -EncodedCommand {encoded}"
-            ));
-            c
+            cmd.args(ssh_options())
+                .arg(host)
+                .arg(format!("powershell -NoProfile -NonInteractive -EncodedCommand {encoded}"));
         }
         Target::Linux(host) => {
-            let mut c = Command::new(SSH);
-            c.args(ssh_options()).arg(host).arg("python3 -u -");
-            c
+            cmd.args(ssh_options()).arg(host).arg("python3 -u -");
         }
-    };
+    }
     cmd.stdout(Stdio::piped()).stderr(Stdio::null());
-    cmd.stdin(if matches!(target, Target::Linux(_)) {
-        Stdio::piped()
-    } else {
-        Stdio::null()
-    });
+    cmd.stdin(if matches!(target, Target::Linux(_)) { Stdio::piped() } else { Stdio::null() });
     #[cfg(windows)]
     cmd.creation_flags(NO_WINDOW);
     let mut child = cmd.spawn()?;
     #[cfg(windows)]
     job::adopt(&child);
     if let (Target::Linux(_), Some(mut stdin)) = (target, child.stdin.take()) {
-        stdin.write_all(LINUX_PROBE.replace('\r', "").as_bytes())?;
+        if let Err(error) = stdin.write_all(LINUX_PROBE.replace('\r', "").as_bytes()) {
+            let _ = child.kill();
+            let _ = child.wait();
+            return Err(error);
+        }
     }
     Ok(child)
 }
@@ -256,9 +249,7 @@ fn parse_disks(text: &str) -> Vec<Disk> {
                 return None;
             }
             for value in [&mut disk.read_percent, &mut disk.write_percent] {
-                *value = value
-                    .filter(|v| v.is_finite() && *v >= 0.0)
-                    .map(|v| v.min(100.0));
+                *value = value.filter(|v| v.is_finite() && *v >= 0.0).map(|v| v.min(100.0));
             }
             Some(disk)
         })
@@ -268,17 +259,11 @@ fn parse_disks(text: &str) -> Vec<Disk> {
 /// PowerShell's -EncodedCommand: the script as UTF-16LE in base64, so no quoting survives
 /// three shells.
 fn encode_powershell(script: &str) -> String {
-    let bytes: Vec<u8> = script
-        .encode_utf16()
-        .flat_map(|u| u.to_le_bytes())
-        .collect();
+    let bytes: Vec<u8> = script.encode_utf16().flat_map(|u| u.to_le_bytes()).collect();
     const ABC: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
     let mut out = String::with_capacity(bytes.len().div_ceil(3) * 4);
     for chunk in bytes.chunks(3) {
-        let n = chunk
-            .iter()
-            .enumerate()
-            .fold(0u32, |n, (i, &b)| n | (b as u32) << (16 - 8 * i));
+        let n = chunk.iter().enumerate().fold(0u32, |n, (i, &b)| n | (b as u32) << (16 - 8 * i));
         for i in 0..4 {
             if i <= chunk.len() {
                 out.push(ABC[(n >> (18 - 6 * i) & 63) as usize] as char);
@@ -334,10 +319,7 @@ mod tests {
         assert_eq!(s.disks[0].busy(), Some(100.0));
         assert_eq!(s.disks[1].busy(), None);
         for malformed in ["oops", "{}", "[]"] {
-            assert!(parse(&format!("S 12 100 200 | D {malformed}"))
-                .unwrap()
-                .disks
-                .is_empty());
+            assert!(parse(&format!("S 12 100 200 | D {malformed}")).unwrap().disks.is_empty());
         }
     }
 }

@@ -52,15 +52,10 @@ fn parse(text: &str) -> Result<Vec<HostConfig>, String> {
             }
             _ => return Err(fail()),
         };
-        hosts.push(HostConfig {
-            name: parts[0].into(),
-            target,
-        });
+        hosts.push(HostConfig { name: parts[0].into(), target });
     }
     if hosts.is_empty() {
-        return Err(
-            "hosts.txt has no machines. Add This PC|local to monitor this computer.".into(),
-        );
+        return Err("hosts.txt has no machines. Add This PC|local to monitor this computer.".into());
     }
     Ok(hosts)
 }
@@ -93,9 +88,6 @@ mod tests {
         ] {
             assert!(parse(text).is_err(), "{text}");
         }
-        assert!(parse("This PC|local\nbad")
-            .err()
-            .unwrap()
-            .contains("line 2"));
+        assert!(parse("This PC|local\nbad").err().unwrap().contains("line 2"));
     }
 }
