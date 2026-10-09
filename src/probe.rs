@@ -75,6 +75,10 @@ const NO_WINDOW: u32 = 0x0800_0000;
 
 const WINDOWS_PROBE: &str = include_str!("collectors/windows.ps1");
 const LINUX_PROBE: &str = include_str!("collectors/linux.py");
+// Keep the remote command short enough for cmd.exe's limit. The full collector
+// travels over stdin and is compiled in memory; no remote file is installed.
+const WINDOWS_BOOTSTRAP: &str =
+    "$script = [Console]::In.ReadToEnd(); & ([ScriptBlock]::Create($script))";
 
 /// Starts the probe thread of one machine.
 pub fn start(target: Target, shared: Shared, children: Children) {
@@ -120,30 +124,40 @@ fn set_status(shared: &Shared, status: &str) {
 }
 
 fn spawn(target: &Target) -> std::io::Result<Child> {
-    let encoded = encode_powershell(WINDOWS_PROBE);
     let mut cmd = Command::new(if matches!(target, Target::Local) { "powershell" } else { "ssh" });
     match target {
         Target::Local => {
-            cmd.args(["-NoProfile", "-NonInteractive", "-EncodedCommand", &encoded]);
+            cmd.args([
+                "-NoProfile",
+                "-NonInteractive",
+                "-EncodedCommand",
+                &encode_powershell(WINDOWS_PROBE),
+            ]);
         }
         Target::Windows(host) => {
-            cmd.args(ssh_options())
-                .arg(host)
-                .arg(format!("powershell -NoProfile -NonInteractive -EncodedCommand {encoded}"));
+            cmd.args(ssh_options()).arg(host).arg(format!(
+                "powershell -NoProfile -NonInteractive -EncodedCommand {}",
+                encode_powershell(WINDOWS_BOOTSTRAP)
+            ));
         }
         Target::Linux(host) => {
             cmd.args(ssh_options()).arg(host).arg("python3 -u -");
         }
     }
     cmd.stdout(Stdio::piped()).stderr(Stdio::null());
-    cmd.stdin(if matches!(target, Target::Linux(_)) { Stdio::piped() } else { Stdio::null() });
+    cmd.stdin(if matches!(target, Target::Local) { Stdio::null() } else { Stdio::piped() });
     #[cfg(windows)]
     cmd.creation_flags(NO_WINDOW);
     let mut child = cmd.spawn()?;
     #[cfg(windows)]
     job::adopt(&child);
-    if let (Target::Linux(_), Some(mut stdin)) = (target, child.stdin.take()) {
-        if let Err(error) = stdin.write_all(LINUX_PROBE.replace('\r', "").as_bytes()) {
+    if let Some(mut stdin) = child.stdin.take() {
+        let script = match target {
+            Target::Windows(_) => WINDOWS_PROBE,
+            Target::Linux(_) => LINUX_PROBE,
+            Target::Local => unreachable!(),
+        };
+        if let Err(error) = stdin.write_all(script.replace('\r', "").as_bytes()) {
             let _ = child.kill();
             let _ = child.wait();
             return Err(error);
