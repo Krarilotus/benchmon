@@ -2,11 +2,12 @@
 //! prints CPU/RAM/GPU and per-disk activity every two seconds, with a JSON disk suffix.
 //! Disk capacity is refreshed every thirty seconds;
 //! nothing is installed on the machine. A probe that ends is restarted after ten
-//! seconds, and every probe process is killed when the app closes.
+//! seconds, and every probe process is killed when its `Monitor` (or the app) closes.
 
 use serde::{Deserialize, Serialize};
 use std::io::{BufRead, BufReader, Write};
 use std::process::{Child, Command, Stdio};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::{Duration, Instant};
@@ -22,7 +23,7 @@ pub enum Target {
     Linux(String),
 }
 
-#[derive(Debug, Serialize)]
+#[derive(Clone, Debug, Deserialize, Serialize)]
 pub struct Sample {
     pub cpu: f32,
     pub ram_used_gb: f32,
@@ -31,7 +32,7 @@ pub struct Sample {
     pub disks: Vec<Disk>,
 }
 
-#[derive(Debug, Deserialize, Serialize)]
+#[derive(Clone, Debug, Deserialize, Serialize)]
 pub struct Disk {
     pub name: String,
     pub used_bytes: f64,
@@ -54,14 +55,14 @@ pub fn busiest_disk(disks: &[Disk]) -> Option<f32> {
     disks.iter().filter_map(Disk::busy).reduce(f32::max)
 }
 
-#[derive(Clone, Copy, Debug, Serialize)]
+#[derive(Clone, Copy, Debug, Deserialize, Serialize)]
 pub struct Gpu {
     pub util: f32,
     pub vram_used_gb: f32,
     pub vram_total_gb: f32,
 }
 
-#[derive(Default)]
+#[derive(Clone, Default)]
 pub struct Reading {
     pub latest: Option<(Arc<Sample>, Instant)>,
     pub status: String,
@@ -80,43 +81,67 @@ const LINUX_PROBE: &str = include_str!("collectors/linux.py");
 const WINDOWS_BOOTSTRAP: &str =
     "$script = [Console]::In.ReadToEnd(); & ([ScriptBlock]::Create($script))";
 
-/// Starts the probe thread of one machine.
-pub fn start(target: Target, shared: Shared, children: Children) {
-    thread::spawn(move || loop {
-        set_status(&shared, "connecting");
-        match spawn(&target) {
-            Ok(mut child) => {
-                let pid = child.id();
-                let stdout = child.stdout.take();
-                children.lock().unwrap().push(child);
-                if let Some(out) = stdout {
-                    for line in BufReader::new(out).lines() {
-                        let Ok(line) = line else { break };
-                        if let Some(sample) = parse(&line) {
-                            let mut r = shared.lock().unwrap();
-                            r.latest = Some((Arc::new(sample), Instant::now()));
-                            r.status = "online".into();
-                        }
-                    }
+/// Starts the probe thread of one machine. It ends once `stop` is set and its probe killed
+/// (`Monitor` does both): a probe is never started or restarted after `stop`.
+pub fn start(target: Target, shared: Shared, children: Children, stop: Arc<AtomicBool>) {
+    thread::spawn(move || {
+        while !stop.load(Ordering::SeqCst) {
+            run_once(&target, &shared, &children, &stop);
+            // The reconnect pause, cut short by `stop`.
+            for _ in 0..100 {
+                if stop.load(Ordering::SeqCst) {
+                    return;
                 }
-                // Reap failed probes rather than retaining handles on every reconnect.
-                let finished = {
-                    let mut active = children.lock().unwrap();
-                    active
-                        .iter()
-                        .position(|child| child.id() == pid)
-                        .map(|index| active.swap_remove(index))
-                };
-                if let Some(mut child) = finished {
+                thread::sleep(Duration::from_millis(100));
+            }
+        }
+    });
+}
+
+/// One probe process, from its start until its output ends.
+fn run_once(target: &Target, shared: &Shared, children: &Children, stop: &AtomicBool) {
+    set_status(shared, "connecting");
+    match spawn(target) {
+        Ok(mut child) => {
+            let pid = child.id();
+            let stdout = child.stdout.take();
+            {
+                // Checked under the lock `Monitor::drop` takes after setting `stop`: no
+                // probe starts unseen by it.
+                let mut active = children.lock().unwrap();
+                if stop.load(Ordering::SeqCst) {
                     let _ = child.kill();
                     let _ = child.wait();
+                    return;
                 }
-                set_status(&shared, "link lost");
+                active.push(child);
             }
-            Err(e) => set_status(&shared, &format!("no probe: {e}")),
+            if let Some(out) = stdout {
+                for line in BufReader::new(out).lines() {
+                    let Ok(line) = line else { break };
+                    if let Some(sample) = parse(&line) {
+                        let mut r = shared.lock().unwrap();
+                        r.latest = Some((Arc::new(sample), Instant::now()));
+                        r.status = "online".into();
+                    }
+                }
+            }
+            // Reap failed probes rather than retaining handles on every reconnect.
+            let finished = {
+                let mut active = children.lock().unwrap();
+                active
+                    .iter()
+                    .position(|child| child.id() == pid)
+                    .map(|index| active.swap_remove(index))
+            };
+            if let Some(mut child) = finished {
+                let _ = child.kill();
+                let _ = child.wait();
+            }
+            set_status(shared, "link lost");
         }
-        thread::sleep(Duration::from_secs(10));
-    });
+        Err(e) => set_status(shared, &format!("no probe: {e}")),
+    }
 }
 
 fn set_status(shared: &Shared, status: &str) {

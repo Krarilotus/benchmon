@@ -1,15 +1,29 @@
 [package]
 name = "benchmon"
-version = "0.3.0"
+version = "0.4.0"
 edition = "2021"
-description = "A compact Windows monitor for local and SSH-connected machines"
+description = "A compact Windows monitor for local and SSH-connected machines, and its probes as a library"
 license = "MIT"
 readme = "README.md"
 repository = "https://github.com/Krarilotus/benchmon"
 publish = false
 
+# The panel is the default; `default-features = false` builds only the probes (the library).
+[features]
+default = ["gui"]
+gui = ["dep:eframe"]
+
+[lib]
+name = "benchmon"
+path = "src/lib.rs"
+
+[[bin]]
+name = "benchmon"
+path = "src/main.rs"
+required-features = ["gui"]
+
 [dependencies]
-eframe = { version = "0.31", default-features = false, features = ["accesskit", "default_fonts", "glow"] }
+eframe = { version = "0.31", default-features = false, features = ["accesskit", "default_fonts", "glow"], optional = true }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 

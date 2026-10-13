@@ -39,6 +39,16 @@ Disk width follows volume capacity. **I/O** shows the busier of read/write time 
 
 Readings: ~2s. Capacity: 30s. Graph: 90 samples. Red link: stale for 8s. Reconnect: 10s. Closing the panel ends its probes; Windows probes also exit when their SSH session disappears.
 
+## > embed
+
+The probes are a library too. Without the panel:
+
+```toml
+benchmon = { git = "https://github.com/Krarilotus/benchmon", tag = "v0.4.0", default-features = false }
+```
+
+`Monitor::start` takes named targets and reads them like the panel does; `reading(name)` gives the latest sample. Dropping the monitor ends its probes.
+
 ## > hack
 
 Windows build: Rust + Visual Studio C++ Build Tools.

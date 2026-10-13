@@ -1,69 +1,43 @@
-//! Compact Windows monitor. Configuration, collection and drawing live in separate modules.
+//! Compact Windows monitor. Configuration and collection live in the library; drawing here.
 #![windows_subsystem = "windows"]
 
-mod config;
-mod probe;
 mod ui;
 
+use benchmon::{config, probe, Monitor, Watched};
 use eframe::egui::{self, FontId};
-use probe::{Children, Reading, Shared};
 use std::collections::VecDeque;
-use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 use ui::{BG, GREEN, HISTORY, RED};
 
+/// What the panel shows of a machine: smoothed bars and history.
+#[derive(Default)]
 struct Host {
-    name: String,
-    shared: Shared,
     shown: [f32; 3],
     history: [VecDeque<Option<f32>>; 4],
     last_seen: Option<Instant>,
 }
 
+/// The monitor drops with the app, and its probes end with it.
 struct App {
+    monitor: Monitor,
     hosts: Vec<Host>,
-    children: Children,
     config_error: Option<String>,
-}
-
-impl Drop for App {
-    fn drop(&mut self) {
-        for child in self.children.lock().unwrap().iter_mut() {
-            let _ = child.kill();
-            let _ = child.wait();
-        }
-    }
 }
 
 impl App {
     fn new() -> Self {
-        let children: Children = Arc::new(Mutex::new(Vec::new()));
-        let mut hosts = Vec::new();
-        let mut config_error = None;
-        match config::load() {
-            Ok(configs) => {
-                for config in configs {
-                    let shared: Shared = Arc::new(Mutex::new(Reading::default()));
-                    probe::start(config.target, shared.clone(), children.clone());
-                    hosts.push(Host {
-                        name: config.name,
-                        shared,
-                        shown: [0.0; 3],
-                        history: Default::default(),
-                        last_seen: None,
-                    });
-                }
-            }
-            Err(error) => config_error = Some(error),
-        }
-        Self { hosts, children, config_error }
+        let (configs, config_error) = match config::load() {
+            Ok(configs) => (configs, None),
+            Err(error) => (Vec::new(), Some(error)),
+        };
+        let monitor = Monitor::start(configs.into_iter().map(|c| (c.name, c.target)));
+        let hosts = monitor.hosts().iter().map(|_| Host::default()).collect();
+        Self { monitor, hosts, config_error }
     }
 
-    fn host(ui: &mut egui::Ui, host: &mut Host, t: f64, dt: f32) {
-        let (sample, status) = {
-            let reading = host.shared.lock().unwrap();
-            (reading.latest.clone(), reading.status.clone())
-        };
+    fn host(ui: &mut egui::Ui, watched: &Watched, host: &mut Host, t: f64, dt: f32) {
+        let reading = watched.reading();
+        let (sample, status) = (reading.latest, reading.status);
         let mut values = [None; 4];
         let mut details = [String::new(), String::new(), String::new()];
         if let Some((sample, at)) = &sample {
@@ -94,7 +68,7 @@ impl App {
             if stale { (status.to_uppercase(), RED) } else { ("ONLINE".into(), GREEN) };
         ui.horizontal(|ui| {
             ui.label(
-                egui::RichText::new(format!("[{}]", host.name))
+                egui::RichText::new(format!("[{}]", watched.name))
                     .font(FontId::monospace(12.0))
                     .color(GREEN)
                     .strong(),
@@ -120,11 +94,11 @@ impl App {
             return 1;
         }
         let deadline = Instant::now() + Duration::from_secs(25);
-        let mut pending: Vec<_> = self.hosts.iter().collect();
+        let mut pending: Vec<_> = self.monitor.hosts().iter().collect();
         let mut failed = false;
         while !pending.is_empty() {
             pending.retain(|host| {
-                let reading = host.shared.lock().unwrap();
+                let reading = host.reading();
                 if let Some((sample, _)) = &reading.latest {
                     let ok = !sample.disks.is_empty();
                     failed |= !ok;
@@ -166,8 +140,8 @@ impl eframe::App for App {
                     ui.label("Edit hosts.txt beside benchmon.exe, then restart.");
                 }
                 egui::ScrollArea::vertical().show(ui, |ui| {
-                    for host in &mut self.hosts {
-                        Self::host(ui, host, t, dt);
+                    for (watched, host) in self.monitor.hosts().iter().zip(&mut self.hosts) {
+                        Self::host(ui, watched, host, t, dt);
                     }
                 });
             });
@@ -180,7 +154,7 @@ fn main() -> eframe::Result {
     if std::env::args().any(|arg| arg == "--check") {
         std::process::exit(app.check());
     }
-    let height = (20.0 + 155.0 * app.hosts.len() as f32).clamp(200.0, 900.0);
+    let height = (20.0 + 155.0 * app.monitor.hosts().len() as f32).clamp(200.0, 900.0);
     let options = eframe::NativeOptions {
         viewport: egui::ViewportBuilder::default()
             .with_title("benchmon")

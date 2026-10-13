@@ -1,5 +1,5 @@
 //! Shared segmented bars, capacity-proportional disk layout and metric history.
-use crate::probe::Disk;
+use benchmon::probe::{self, Disk};
 use eframe::egui::{self, Align2, Color32, FontId, Pos2, Rect, Shape, Stroke, Vec2};
 use std::collections::VecDeque;
 
@@ -209,7 +209,7 @@ pub fn disks(ui: &mut egui::Ui, disks: &[Disk], t: f64) {
             },
         );
     }
-    let busiest = crate::probe::busiest_disk(disks);
+    let busiest = probe::busiest_disk(disks);
     let (io_text, io_color) =
         busiest.map_or(("n/a".into(), AMBER), |v| (format!("{v:5.1}%"), Metric::Disk.base()));
     let total: f64 = disks.iter().map(|disk| disk.total_bytes).sum();
