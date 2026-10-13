@@ -68,6 +68,28 @@ pub struct Reading {
     pub status: String,
 }
 
+/// A sample older than this is stale: the panel shows the probe's status instead of ONLINE.
+pub const STALE_AFTER: Duration = Duration::from_secs(8);
+
+/// How long a lost probe waits before it connects again (and again, until its monitor stops).
+pub const RECONNECT: Duration = Duration::from_secs(10);
+
+impl Reading {
+    pub fn stale(&self) -> bool {
+        self.latest.as_ref().is_none_or(|(_, at)| at.elapsed() > STALE_AFTER)
+    }
+
+    /// What the panel shows for the machine: ONLINE while samples are fresh, else the
+    /// probe's status (CONNECTING, LINK LOST, NO PROBE: ...).
+    pub fn label(&self) -> String {
+        if self.stale() {
+            self.status.to_uppercase()
+        } else {
+            "ONLINE".into()
+        }
+    }
+}
+
 pub type Shared = Arc<Mutex<Reading>>;
 pub type Children = Arc<Mutex<Vec<Child>>>;
 
@@ -84,11 +106,24 @@ const WINDOWS_BOOTSTRAP: &str =
 /// Starts the probe thread of one machine. It ends once `stop` is set and its probe killed
 /// (`Monitor` does both): a probe is never started or restarted after `stop`.
 pub fn start(target: Target, shared: Shared, children: Children, stop: Arc<AtomicBool>) {
+    start_with(target, shared, children, stop, spawn);
+}
+
+/// `start` with the probe process made by `spawn` (a test's fake probe).
+fn start_with(
+    target: Target,
+    shared: Shared,
+    children: Children,
+    stop: Arc<AtomicBool>,
+    spawn: fn(&Target) -> std::io::Result<Child>,
+) {
     thread::spawn(move || {
+        // Reconnecting as ever: a probe that ends is started again after RECONNECT, for as
+        // long as the app (or its monitor) runs; `stop` alone ends the loop.
         while !stop.load(Ordering::SeqCst) {
-            run_once(&target, &shared, &children, &stop);
-            // The reconnect pause, cut short by `stop`.
-            for _ in 0..100 {
+            run_once(&target, &shared, &children, &stop, spawn);
+            let resume = Instant::now() + RECONNECT;
+            while Instant::now() < resume {
                 if stop.load(Ordering::SeqCst) {
                     return;
                 }
@@ -99,7 +134,13 @@ pub fn start(target: Target, shared: Shared, children: Children, stop: Arc<Atomi
 }
 
 /// One probe process, from its start until its output ends.
-fn run_once(target: &Target, shared: &Shared, children: &Children, stop: &AtomicBool) {
+fn run_once(
+    target: &Target,
+    shared: &Shared,
+    children: &Children,
+    stop: &AtomicBool,
+    spawn: fn(&Target) -> std::io::Result<Child>,
+) {
     set_status(shared, "connecting");
     match spawn(target) {
         Ok(mut child) => {
@@ -317,6 +358,79 @@ fn encode_powershell(script: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::atomic::AtomicBool;
+
+    /// Whether the fake machine is there: its probe streams samples; else it fails at once,
+    /// as ssh does when its host is gone.
+    static UP: AtomicBool = AtomicBool::new(true);
+
+    #[cfg(windows)]
+    fn fake(_: &Target) -> std::io::Result<Child> {
+        let script = if UP.load(Ordering::SeqCst) {
+            "while ($true) { [Console]::Out.WriteLine('S 12 8388608 16777216 | D []'); [Console]::Out.Flush(); Start-Sleep -Milliseconds 300 }"
+        } else {
+            "exit 255"
+        };
+        let mut c = Command::new("powershell");
+        c.args(["-NoProfile", "-NonInteractive", "-Command", script]);
+        c.stdout(Stdio::piped()).stderr(Stdio::null()).stdin(Stdio::null());
+        c.creation_flags(NO_WINDOW);
+        c.spawn()
+    }
+
+    /// Waits up to `limit` for `done`, checking every 100 ms; how long it took.
+    fn within(limit: Duration, done: impl Fn() -> bool) -> Option<Duration> {
+        let start = Instant::now();
+        while start.elapsed() < limit {
+            if done() {
+                return Some(start.elapsed());
+            }
+            thread::sleep(Duration::from_millis(100));
+        }
+        None
+    }
+
+    #[test]
+    #[cfg(windows)]
+    fn a_lost_probe_reconnects_when_its_machine_is_back() {
+        let shared: Shared = Arc::new(Mutex::new(Reading::default()));
+        let children: Children = Arc::new(Mutex::new(Vec::new()));
+        let stop = Arc::new(AtomicBool::new(false));
+        start_with(Target::Local, shared.clone(), children.clone(), stop.clone(), fake);
+        let reading = || shared.lock().unwrap().clone();
+        within(Duration::from_secs(20), || reading().label() == "ONLINE").expect("online at first");
+
+        // The machine goes away: its connection drops, and reconnecting fails for a while.
+        UP.store(false, Ordering::SeqCst);
+        for child in children.lock().unwrap().iter_mut() {
+            let _ = child.kill();
+        }
+        within(Duration::from_secs(5), || reading().status == "link lost").expect("link lost");
+        within(STALE_AFTER + Duration::from_secs(3), || reading().label() == "LINK LOST")
+            .expect("the panel shows LINK LOST once the last sample is stale");
+        // At least one reconnect fails while it is away.
+        thread::sleep(RECONNECT + Duration::from_secs(2));
+        assert_eq!(reading().label(), "LINK LOST");
+        let lost_at = reading().latest.map(|(_, at)| at);
+
+        // Back: within one reconnect pause, fresh samples, and the panel says ONLINE again.
+        UP.store(true, Ordering::SeqCst);
+        let back = within(RECONNECT + Duration::from_secs(5), || {
+            let r = reading();
+            r.label() == "ONLINE" && r.latest.map(|(_, at)| at) != lost_at
+        })
+        .expect("readings resume after the machine is back");
+        assert!(back <= RECONNECT + Duration::from_secs(5), "took {back:?}");
+        eprintln!(
+            "back online {back:?} after the machine returned (reconnect pause {RECONNECT:?})"
+        );
+
+        // Only `stop` ends it.
+        stop.store(true, Ordering::SeqCst);
+        for child in children.lock().unwrap().iter_mut() {
+            let _ = child.kill();
+        }
+    }
 
     #[test]
     fn base64_matches_the_standard() {

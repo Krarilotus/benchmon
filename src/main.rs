@@ -37,7 +37,8 @@ impl App {
 
     fn host(ui: &mut egui::Ui, watched: &Watched, host: &mut Host, t: f64, dt: f32) {
         let reading = watched.reading();
-        let (sample, status) = (reading.latest, reading.status);
+        let (stale, label) = (reading.stale(), reading.label());
+        let sample = reading.latest;
         let mut values = [None; 4];
         let mut details = [String::new(), String::new(), String::new()];
         if let Some((sample, at)) = &sample {
@@ -63,9 +64,7 @@ impl App {
         for (shown, target) in host.shown.iter_mut().zip(values) {
             *shown += (target.unwrap_or(0.0) - *shown) * (1.0 - (-6.0 * dt).exp());
         }
-        let stale = sample.as_ref().is_none_or(|(_, at)| at.elapsed() > Duration::from_secs(8));
-        let (state, color) =
-            if stale { (status.to_uppercase(), RED) } else { ("ONLINE".into(), GREEN) };
+        let (state, color) = if stale { (label, RED) } else { (label, GREEN) };
         ui.horizontal(|ui| {
             ui.label(
                 egui::RichText::new(format!("[{}]", watched.name))
