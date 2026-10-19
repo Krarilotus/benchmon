@@ -2,6 +2,7 @@
 use benchmon::probe::{self, Disk};
 use eframe::egui::{self, Align2, Color32, FontId, Pos2, Rect, Shape, Stroke, Vec2};
 use std::collections::VecDeque;
+use std::time::Duration;
 
 pub const HISTORY: usize = 90;
 pub const BG: Color32 = Color32::from_rgb(4, 9, 6);
@@ -74,8 +75,13 @@ fn text(
     p.text(at, align, label, FontId::monospace(size), color);
 }
 
+/// How often the panel redraws without input: readings arrive every two seconds, so a few
+/// frames a second carry them and the scans (a GL frame costs about 2 ms, half of it in the
+/// kernel; 20 a second made the panel this PC's busiest process).
+pub const FRAME: Duration = Duration::from_millis(250);
 const SEGMENTS: usize = 32;
-const CPU_SCAN_SPEED: f64 = 48.0;
+/// One segment a frame.
+const CPU_SCAN_SPEED: f64 = 4.0;
 const DISK_SCAN_SPEED: f64 = 1.0;
 const LABEL_WIDTH: f32 = 38.0;
 const VALUE_WIDTH: f32 = 118.0;

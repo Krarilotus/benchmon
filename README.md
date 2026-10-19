@@ -37,7 +37,7 @@ Green CPU. Red RAM. Orange GPU. Blue disks. Bars brighten above 50%, then harder
 
 Disk width follows volume capacity. **I/O** shows the busier of read/write time as a percentage. **SPACE** shows occupied capacity. Hover for per-volume numbers. Windows shows fixed drive letters; Linux shows local block filesystems. GPU uses the first NVIDIA card.
 
-Readings: ~2s. Capacity: 30s. Graph: 90 samples. Red link: stale for 8s. Reconnect: 10s. Closing the panel ends its probes; Windows probes also exit when their SSH session disappears.
+Readings: ~2s. Capacity: 30s. Graph: 90 samples. Red link: stale for 8s, with the age of the values shown. A probe silent for 30s (45s for its first sample) is ended with everything it started and connected again; reconnects wait 2s, doubling to 60s while they fail. Closing the panel ends its probes; Windows probes also exit when their SSH session disappears.
 
 ## > embed
 

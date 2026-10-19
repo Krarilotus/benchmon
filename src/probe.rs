@@ -1,15 +1,17 @@
 //! One probe per machine: a long-lived process (PowerShell locally, `ssh` to the others) that
 //! prints CPU/RAM/GPU and per-disk activity every two seconds, with a JSON disk suffix.
-//! Disk capacity is refreshed every thirty seconds;
-//! nothing is installed on the machine. A probe that ends is restarted after ten
-//! seconds, and every probe process is killed when its `Monitor` (or the app) closes.
+//! Disk capacity is refreshed every thirty seconds; nothing is installed on the machine.
+//! Every state of a probe has a deadline: one that ends, or stays silent too long (a hung
+//! collector, a dead link that keeps its pipe open), is ended with every process it started
+//! and connected again, after a pause that doubles while attempts deliver nothing.
 
 use serde::{Deserialize, Serialize};
+use std::fmt;
 use std::io::{BufRead, BufReader, Write};
-use std::process::{Child, Command, Stdio};
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::process::{Child, ChildStdout, Command, Stdio};
+use std::sync::mpsc::{self, Receiver, RecvTimeoutError, Sender};
 use std::sync::{Arc, Mutex};
-use std::thread;
+use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
 
 #[cfg(windows)]
@@ -62,36 +64,93 @@ pub struct Gpu {
     pub vram_total_gb: f32,
 }
 
+/// What a machine's probe is doing.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub enum Status {
+    /// Started; no sample from this connection yet.
+    #[default]
+    Connecting,
+    /// Its samples arrive (the reading tells whether the last one is still fresh).
+    Online,
+    /// It ended or stayed silent past its deadline; it connects again after a pause.
+    LinkLost,
+    /// It could not be started.
+    NoProbe(String),
+}
+
+impl fmt::Display for Status {
+    fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
+        match self {
+            Status::Connecting => f.write_str("connecting"),
+            Status::Online => f.write_str("online"),
+            Status::LinkLost => f.write_str("link lost"),
+            Status::NoProbe(error) => write!(f, "no probe: {error}"),
+        }
+    }
+}
+
 #[derive(Clone, Default)]
 pub struct Reading {
+    /// The latest sample and when it arrived; never refreshed without a new sample.
     pub latest: Option<(Arc<Sample>, Instant)>,
-    pub status: String,
+    pub status: Status,
 }
 
 /// A sample older than this is stale: the panel shows the probe's status instead of ONLINE.
 pub const STALE_AFTER: Duration = Duration::from_secs(8);
-
-/// How long a lost probe waits before it connects again (and again, until its monitor stops).
-pub const RECONNECT: Duration = Duration::from_secs(10);
 
 impl Reading {
     pub fn stale(&self) -> bool {
         self.latest.as_ref().is_none_or(|(_, at)| at.elapsed() > STALE_AFTER)
     }
 
-    /// What the panel shows for the machine: ONLINE while samples are fresh, else the
-    /// probe's status (CONNECTING, LINK LOST, NO PROBE: ...).
+    /// What the panel shows for the machine: ONLINE while samples are fresh, else what the
+    /// probe is doing (STALE while a running probe is silent, CONNECTING, LINK LOST,
+    /// NO PROBE: ...) and the age of the values it last delivered.
     pub fn label(&self) -> String {
-        if self.stale() {
-            self.status.to_uppercase()
-        } else {
-            "ONLINE".into()
+        if !self.stale() {
+            return "ONLINE".into();
+        }
+        let state = match &self.status {
+            Status::Online => "STALE".into(),
+            other => other.to_string().to_uppercase(),
+        };
+        match &self.latest {
+            Some((_, at)) => format!("{state} ({})", age(at.elapsed())),
+            None => state,
         }
     }
 }
 
+fn age(elapsed: Duration) -> String {
+    match elapsed.as_secs() {
+        s @ 0..120 => format!("{s}s"),
+        s @ 120..7200 => format!("{}m", s / 60),
+        s => format!("{}h", s / 3600),
+    }
+}
+
 pub type Shared = Arc<Mutex<Reading>>;
-pub type Children = Arc<Mutex<Vec<Child>>>;
+
+/// The deadlines that bound every state of a probe.
+#[derive(Clone, Copy)]
+pub(crate) struct Timing {
+    /// For a new probe's first sample: ssh's connect and PowerShell's compile, under load.
+    pub first_sample: Duration,
+    /// Between samples, before a silent probe is ended.
+    pub silence: Duration,
+    /// The reconnect pause: `pause` after a probe that delivered, doubling up to `max_pause`
+    /// while attempts deliver nothing.
+    pub pause: Duration,
+    pub max_pause: Duration,
+}
+
+pub(crate) const TIMING: Timing = Timing {
+    first_sample: Duration::from_secs(45),
+    silence: Duration::from_secs(30),
+    pause: Duration::from_secs(2),
+    max_pause: Duration::from_secs(60),
+};
 
 #[cfg(windows)]
 const NO_WINDOW: u32 = 0x0800_0000;
@@ -103,93 +162,177 @@ const LINUX_PROBE: &str = include_str!("collectors/linux.py");
 const WINDOWS_BOOTSTRAP: &str =
     "$script = [Console]::In.ReadToEnd(); & ([ScriptBlock]::Create($script))";
 
-/// Starts the probe thread of one machine. It ends once `stop` is set and its probe killed
-/// (`Monitor` does both): a probe is never started or restarted after `stop`.
-pub fn start(target: Target, shared: Shared, children: Children, stop: Arc<AtomicBool>) {
-    start_with(target, shared, children, stop, spawn);
+/// What a probe's thread waits for: a line of a connection, a connection's end, or `Stop`.
+enum Event {
+    Line(u64, String),
+    Ended(u64),
+    Stop,
 }
 
-/// `start` with the probe process made by `spawn` (a test's fake probe).
-fn start_with(
-    target: Target,
-    shared: Shared,
-    children: Children,
-    stop: Arc<AtomicBool>,
-    spawn: fn(&Target) -> std::io::Result<Child>,
-) {
-    thread::spawn(move || {
-        // Reconnecting as ever: a probe that ends is started again after RECONNECT, for as
-        // long as the app (or its monitor) runs; `stop` alone ends the loop.
-        while !stop.load(Ordering::SeqCst) {
-            run_once(&target, &shared, &children, &stop, spawn);
-            let resume = Instant::now() + RECONNECT;
-            while Instant::now() < resume {
-                if stop.load(Ordering::SeqCst) {
-                    return;
-                }
-                thread::sleep(Duration::from_millis(100));
-            }
-        }
-    });
+/// The thread reading one machine, from `start` until it is dropped, which ends it and its
+/// process at once, wherever it waits.
+pub(crate) struct Probe {
+    events: Sender<Event>,
+    thread: Option<JoinHandle<()>>,
 }
 
-/// One probe process, from its start until its output ends.
-fn run_once(
-    target: &Target,
-    shared: &Shared,
-    children: &Children,
-    stop: &AtomicBool,
-    spawn: fn(&Target) -> std::io::Result<Child>,
-) {
-    set_status(shared, "connecting");
-    match spawn(target) {
-        Ok(mut child) => {
-            let pid = child.id();
-            let stdout = child.stdout.take();
-            {
-                // Checked under the lock `Monitor::drop` takes after setting `stop`: no
-                // probe starts unseen by it.
-                let mut active = children.lock().unwrap();
-                if stop.load(Ordering::SeqCst) {
-                    let _ = child.kill();
-                    let _ = child.wait();
-                    return;
-                }
-                active.push(child);
-            }
-            if let Some(out) = stdout {
-                for line in BufReader::new(out).lines() {
-                    let Ok(line) = line else { break };
-                    if let Some(sample) = parse(&line) {
-                        let mut r = shared.lock().unwrap();
-                        r.latest = Some((Arc::new(sample), Instant::now()));
-                        r.status = "online".into();
-                    }
-                }
-            }
-            // Reap failed probes rather than retaining handles on every reconnect.
-            let finished = {
-                let mut active = children.lock().unwrap();
-                active
-                    .iter()
-                    .position(|child| child.id() == pid)
-                    .map(|index| active.swap_remove(index))
-            };
-            if let Some(mut child) = finished {
-                let _ = child.kill();
-                let _ = child.wait();
-            }
-            set_status(shared, "link lost");
-        }
-        Err(e) => set_status(shared, &format!("no probe: {e}")),
+impl Probe {
+    /// Starts reading `target` into `shared`, its processes made by `spawn`.
+    pub fn start(
+        target: Target,
+        shared: Shared,
+        timing: Timing,
+        spawn: impl Fn(&Target) -> std::io::Result<Child> + Send + 'static,
+    ) -> Self {
+        let (events, inbox) = mpsc::channel();
+        let lines = events.clone();
+        let thread = thread::spawn(move || {
+            supervise(&target, &shared, timing, &spawn, &lines, &inbox);
+        });
+        Self { events, thread: Some(thread) }
+    }
+
+    /// Asks the probe to stop, without waiting for it (dropping it waits).
+    pub fn stop(&self) {
+        let _ = self.events.send(Event::Stop);
     }
 }
 
-fn set_status(shared: &Shared, status: &str) {
-    shared.lock().unwrap().status = status.into();
+impl Drop for Probe {
+    fn drop(&mut self) {
+        self.stop();
+        if let Some(thread) = self.thread.take() {
+            let _ = thread.join();
+        }
+    }
 }
 
-fn spawn(target: &Target) -> std::io::Result<Child> {
+/// Connects again and again, until stopped (`None`).
+fn supervise(
+    target: &Target,
+    shared: &Shared,
+    timing: Timing,
+    spawn: &dyn Fn(&Target) -> std::io::Result<Child>,
+    lines: &Sender<Event>,
+    inbox: &Receiver<Event>,
+) -> Option<()> {
+    let mut pause = timing.pause;
+    for connection in 0.. {
+        if connect(target, shared, timing, spawn, connection, lines, inbox)? {
+            pause = timing.pause;
+        }
+        let resume = Instant::now() + pause;
+        while let Some(event) = next(inbox, resume) {
+            if let Event::Stop = event {
+                return None;
+            }
+        }
+        pause = (pause * 2).min(timing.max_pause);
+    }
+    Some(())
+}
+
+/// One probe process, from its start until it ends, misses its deadline or is stopped:
+/// whether it delivered a sample, or `None` once stopped.
+fn connect(
+    target: &Target,
+    shared: &Shared,
+    timing: Timing,
+    spawn: &dyn Fn(&Target) -> std::io::Result<Child>,
+    connection: u64,
+    lines: &Sender<Event>,
+    inbox: &Receiver<Event>,
+) -> Option<bool> {
+    set_status(shared, Status::Connecting);
+    let mut process = match spawn(target) {
+        Ok(child) => Process::new(child),
+        Err(error) => {
+            set_status(shared, Status::NoProbe(error.to_string()));
+            return Some(false);
+        }
+    };
+    if let Some(out) = process.child.stdout.take() {
+        pump(out, connection, lines.clone());
+    }
+    let mut delivered = false;
+    let mut deadline = Instant::now() + timing.first_sample;
+    while let Some(event) = next(inbox, deadline) {
+        match event {
+            Event::Line(c, line) if c == connection => {
+                if let Some(sample) = parse(&line) {
+                    let mut reading = shared.lock().unwrap();
+                    reading.latest = Some((Arc::new(sample), Instant::now()));
+                    reading.status = Status::Online;
+                    delivered = true;
+                    deadline = Instant::now() + timing.silence;
+                }
+            }
+            Event::Ended(c) if c == connection => break,
+            // An earlier connection's last words.
+            Event::Line(..) | Event::Ended(_) => {}
+            Event::Stop => return None,
+        }
+    }
+    drop(process);
+    set_status(shared, Status::LinkLost);
+    Some(delivered)
+}
+
+/// The next event before `deadline`, if one comes.
+fn next(inbox: &Receiver<Event>, deadline: Instant) -> Option<Event> {
+    match inbox.recv_timeout(deadline.saturating_duration_since(Instant::now())) {
+        Ok(event) => Some(event),
+        Err(RecvTimeoutError::Timeout) => None,
+        // Unreachable while the probe holds a sender itself; stop all the same.
+        Err(RecvTimeoutError::Disconnected) => Some(Event::Stop),
+    }
+}
+
+/// Forwards a probe's lines until its output closes, which ending its process does.
+fn pump(out: ChildStdout, connection: u64, lines: Sender<Event>) {
+    thread::spawn(move || {
+        for line in BufReader::new(out).split(b'\n') {
+            let Ok(line) = line else { break };
+            let line = String::from_utf8_lossy(&line).into_owned();
+            if lines.send(Event::Line(connection, line)).is_err() {
+                return;
+            }
+        }
+        let _ = lines.send(Event::Ended(connection));
+    });
+}
+
+fn set_status(shared: &Shared, status: Status) {
+    shared.lock().unwrap().status = status;
+}
+
+/// A probe process, ended with everything it started when dropped.
+struct Process {
+    child: Child,
+    #[cfg(windows)]
+    job: Option<job::Job>,
+}
+
+impl Process {
+    fn new(child: Child) -> Self {
+        Self {
+            #[cfg(windows)]
+            job: job::Job::holding(&child),
+            child,
+        }
+    }
+}
+
+impl Drop for Process {
+    fn drop(&mut self) {
+        #[cfg(windows)]
+        drop(self.job.take());
+        let _ = self.child.kill();
+        let _ = self.child.wait();
+    }
+}
+
+pub(crate) fn spawn(target: &Target) -> std::io::Result<Child> {
     let mut cmd = Command::new(if matches!(target, Target::Local) { "powershell" } else { "ssh" });
     match target {
         Target::Local => {
@@ -215,8 +358,6 @@ fn spawn(target: &Target) -> std::io::Result<Child> {
     #[cfg(windows)]
     cmd.creation_flags(NO_WINDOW);
     let mut child = cmd.spawn()?;
-    #[cfg(windows)]
-    job::adopt(&child);
     if let Some(mut stdin) = child.stdin.take() {
         let script = match target {
             Target::Windows(_) => WINDOWS_PROBE,
@@ -232,41 +373,50 @@ fn spawn(target: &Target) -> std::io::Result<Child> {
     Ok(child)
 }
 
-/// Probe processes live in a job that Windows kills when the app's handle to it closes, so
-/// none outlives the app, however it ends.
+/// Each probe process lives in a job of its own that Windows ends, with every process the
+/// probe started (nvidia-smi, the compiler behind Add-Type), when its handle closes: when the
+/// probe is ended, and however the app ends. No grandchild outlives it or holds its output open.
 #[cfg(windows)]
 mod job {
     use std::os::windows::io::AsRawHandle;
     use std::process::Child;
-    use std::sync::OnceLock;
+    use windows_sys::Win32::Foundation::{CloseHandle, HANDLE};
     use windows_sys::Win32::System::JobObjects::{
         AssignProcessToJobObject, CreateJobObjectW, JobObjectExtendedLimitInformation,
         SetInformationJobObject, JOBOBJECT_EXTENDED_LIMIT_INFORMATION,
         JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE,
     };
 
-    struct Job(isize);
+    pub struct Job(HANDLE);
 
-    fn job() -> isize {
-        static JOB: OnceLock<Job> = OnceLock::new();
-        JOB.get_or_init(|| unsafe {
-            let handle = CreateJobObjectW(std::ptr::null(), std::ptr::null());
-            let mut info: JOBOBJECT_EXTENDED_LIMIT_INFORMATION = std::mem::zeroed();
-            info.BasicLimitInformation.LimitFlags = JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE;
-            SetInformationJobObject(
-                handle,
-                JobObjectExtendedLimitInformation,
-                &info as *const _ as *const _,
-                std::mem::size_of::<JOBOBJECT_EXTENDED_LIMIT_INFORMATION>() as u32,
-            );
-            Job(handle as isize)
-        })
-        .0
+    impl Job {
+        pub fn holding(child: &Child) -> Option<Self> {
+            unsafe {
+                let handle = CreateJobObjectW(std::ptr::null(), std::ptr::null());
+                if handle.is_null() {
+                    return None;
+                }
+                let job = Job(handle);
+                let mut info: JOBOBJECT_EXTENDED_LIMIT_INFORMATION = std::mem::zeroed();
+                info.BasicLimitInformation.LimitFlags = JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE;
+                let limited = SetInformationJobObject(
+                    handle,
+                    JobObjectExtendedLimitInformation,
+                    &info as *const _ as *const _,
+                    std::mem::size_of::<JOBOBJECT_EXTENDED_LIMIT_INFORMATION>() as u32,
+                ) != 0;
+                let held =
+                    limited && AssignProcessToJobObject(handle, child.as_raw_handle() as _) != 0;
+                held.then_some(job)
+            }
+        }
     }
 
-    pub fn adopt(child: &Child) {
-        unsafe {
-            AssignProcessToJobObject(job() as _, child.as_raw_handle() as _);
+    impl Drop for Job {
+        fn drop(&mut self) {
+            unsafe {
+                CloseHandle(self.0);
+            }
         }
     }
 }
@@ -358,19 +508,18 @@ fn encode_powershell(script: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::sync::atomic::AtomicBool;
 
-    /// Whether the fake machine is there: its probe streams samples; else it fails at once,
-    /// as ssh does when its host is gone.
-    static UP: AtomicBool = AtomicBool::new(true);
+    /// Short deadlines, so a test sees every state end.
+    const QUICK: Timing = Timing {
+        first_sample: Duration::from_secs(4),
+        silence: Duration::from_secs(4),
+        pause: Duration::from_millis(200),
+        max_pause: Duration::from_millis(800),
+    };
 
+    /// A fake probe: a PowerShell running `script`.
     #[cfg(windows)]
-    fn fake(_: &Target) -> std::io::Result<Child> {
-        let script = if UP.load(Ordering::SeqCst) {
-            "while ($true) { [Console]::Out.WriteLine('S 12 8388608 16777216 | D []'); [Console]::Out.Flush(); Start-Sleep -Milliseconds 300 }"
-        } else {
-            "exit 255"
-        };
+    fn fake(script: &str) -> std::io::Result<Child> {
         let mut c = Command::new("powershell");
         c.args(["-NoProfile", "-NonInteractive", "-Command", script]);
         c.stdout(Stdio::piped()).stderr(Stdio::null()).stdin(Stdio::null());
@@ -378,58 +527,107 @@ mod tests {
         c.spawn()
     }
 
-    /// Waits up to `limit` for `done`, checking every 100 ms; how long it took.
+    #[cfg(windows)]
+    const SAMPLE: &str =
+        "[Console]::Out.WriteLine('S 12 8388608 16777216 | D []'); [Console]::Out.Flush()";
+
+    /// Starts a probe whose `n`th attempt is `attempt(n)`; the probe and when each attempt began.
+    fn probe(
+        attempt: impl Fn(usize) -> std::io::Result<Child> + Send + 'static,
+    ) -> (Probe, Shared, Arc<Mutex<Vec<Instant>>>) {
+        let shared: Shared = Arc::default();
+        let attempts: Arc<Mutex<Vec<Instant>>> = Arc::default();
+        let log = attempts.clone();
+        let probe = Probe::start(Target::Local, shared.clone(), QUICK, move |_| {
+            let n = {
+                let mut log = log.lock().unwrap();
+                log.push(Instant::now());
+                log.len() - 1
+            };
+            attempt(n)
+        });
+        (probe, shared, attempts)
+    }
+
+    /// Waits up to `limit` for `done`, checking every 50 ms; how long it took.
     fn within(limit: Duration, done: impl Fn() -> bool) -> Option<Duration> {
         let start = Instant::now();
         while start.elapsed() < limit {
             if done() {
                 return Some(start.elapsed());
             }
-            thread::sleep(Duration::from_millis(100));
+            thread::sleep(Duration::from_millis(50));
         }
         None
     }
 
+    /// The panel stuck at CONNECTING under load: a probe that starts and then never answers, or
+    /// answers once and falls silent (a hung collector), is ended and started again.
     #[test]
     #[cfg(windows)]
-    fn a_lost_probe_reconnects_when_its_machine_is_back() {
-        let shared: Shared = Arc::new(Mutex::new(Reading::default()));
-        let children: Children = Arc::new(Mutex::new(Vec::new()));
-        let stop = Arc::new(AtomicBool::new(false));
-        start_with(Target::Local, shared.clone(), children.clone(), stop.clone(), fake);
+    fn a_silent_probe_is_ended_and_started_again() {
+        let (_probe, shared, attempts) = probe(|n| match n {
+            0 => fake("Start-Sleep 3600"),
+            1 => fake(&format!("{SAMPLE}; Start-Sleep 3600")),
+            _ => fake(&format!("while ($true) {{ {SAMPLE}; Start-Sleep -Milliseconds 300 }}")),
+        });
         let reading = || shared.lock().unwrap().clone();
-        within(Duration::from_secs(20), || reading().label() == "ONLINE").expect("online at first");
+        let count = || attempts.lock().unwrap().len();
 
-        // The machine goes away: its connection drops, and reconnecting fails for a while.
-        UP.store(false, Ordering::SeqCst);
-        for child in children.lock().unwrap().iter_mut() {
-            let _ = child.kill();
-        }
-        within(Duration::from_secs(5), || reading().status == "link lost").expect("link lost");
-        within(STALE_AFTER + Duration::from_secs(3), || reading().label() == "LINK LOST")
-            .expect("the panel shows LINK LOST once the last sample is stale");
-        // At least one reconnect fails while it is away.
-        thread::sleep(RECONNECT + Duration::from_secs(2));
-        assert_eq!(reading().label(), "LINK LOST");
-        let lost_at = reading().latest.map(|(_, at)| at);
-
-        // Back: within one reconnect pause, fresh samples, and the panel says ONLINE again.
-        UP.store(true, Ordering::SeqCst);
-        let back = within(RECONNECT + Duration::from_secs(5), || {
+        within(QUICK.first_sample + Duration::from_secs(5), || reading().label() == "ONLINE")
+            .expect("the probe that never answered was replaced by one that does");
+        assert_eq!(count(), 2);
+        let silent_since = reading().latest.map(|(_, at)| at);
+        within(QUICK.silence + Duration::from_secs(5), || {
             let r = reading();
-            r.label() == "ONLINE" && r.latest.map(|(_, at)| at) != lost_at
+            r.label() == "ONLINE" && r.latest.map(|(_, at)| at) != silent_since
         })
-        .expect("readings resume after the machine is back");
-        assert!(back <= RECONNECT + Duration::from_secs(5), "took {back:?}");
-        eprintln!(
-            "back online {back:?} after the machine returned (reconnect pause {RECONNECT:?})"
-        );
+        .expect("the silent probe was replaced and fresh samples arrive");
+        assert_eq!(count(), 3);
+    }
 
-        // Only `stop` ends it.
-        stop.store(true, Ordering::SeqCst);
-        for child in children.lock().unwrap().iter_mut() {
-            let _ = child.kill();
+    #[test]
+    #[cfg(windows)]
+    fn reconnects_back_off_while_they_fail_and_resume_when_the_machine_is_back() {
+        const DOWN: usize = 5;
+        let (probe, shared, attempts) = probe(|n| match n {
+            0..DOWN => Err(std::io::Error::other("down")),
+            _ => fake(&format!("while ($true) {{ {SAMPLE}; Start-Sleep -Milliseconds 300 }}")),
+        });
+        within(Duration::from_secs(15), || shared.lock().unwrap().label() == "ONLINE")
+            .expect("readings resume once the machine is back");
+        let at = attempts.lock().unwrap().clone();
+        let pauses: Vec<Duration> = at.windows(2).take(DOWN).map(|w| w[1] - w[0]).collect();
+        // 200 ms doubling, capped at 800 ms.
+        for (pause, expected) in pauses.iter().zip([200, 400, 800, 800, 800]) {
+            let expected = Duration::from_millis(expected);
+            assert!(
+                *pause >= expected && *pause < expected + Duration::from_millis(400),
+                "pauses {pauses:?}"
+            );
         }
+
+        let dropped = Instant::now();
+        drop(probe);
+        assert!(
+            dropped.elapsed() < Duration::from_secs(3),
+            "stopping took {:?}",
+            dropped.elapsed()
+        );
+    }
+
+    /// A silent but running probe's values are not shown as live: stale, with their age.
+    #[test]
+    fn stale_values_are_labelled_stale_with_their_age() {
+        let old = Instant::now().checked_sub(Duration::from_secs(20)).unwrap();
+        let reading = |at: Option<Instant>, status| Reading {
+            latest: at.map(|at| (Arc::new(parse("S 1 1 2").unwrap()), at)),
+            status,
+        };
+        assert_eq!(reading(Some(Instant::now()), Status::Online).label(), "ONLINE");
+        assert_eq!(reading(Some(old), Status::Online).label(), "STALE (20s)");
+        assert_eq!(reading(Some(old), Status::Connecting).label(), "CONNECTING (20s)");
+        assert_eq!(reading(None, Status::Connecting).label(), "CONNECTING");
     }
 
     #[test]

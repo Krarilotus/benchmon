@@ -130,7 +130,7 @@ impl App {
 impl eframe::App for App {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
         let t = ctx.input(|input| input.time);
-        let dt = ctx.input(|input| input.stable_dt).min(0.1);
+        let dt = ctx.input(|input| input.stable_dt).min(2.0 * ui::FRAME.as_secs_f32());
         egui::CentralPanel::default()
             .frame(egui::Frame::default().fill(BG).inner_margin(10.0))
             .show(ctx, |ui| {
@@ -144,7 +144,7 @@ impl eframe::App for App {
                     }
                 });
             });
-        ctx.request_repaint_after(Duration::from_millis(50));
+        ctx.request_repaint_after(ui::FRAME);
     }
 }
 

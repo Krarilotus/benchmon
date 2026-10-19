@@ -1,12 +1,12 @@
 //! A set of probes owned together: started at once, read at any time, stopped when dropped.
-use crate::probe::{self, Children, Reading, Shared, Target};
-use std::sync::atomic::{AtomicBool, Ordering};
+use crate::probe::{self, Probe, Reading, Shared, Target};
 use std::sync::{Arc, Mutex};
 
 /// One machine a `Monitor` reads.
 pub struct Watched {
     pub name: String,
     shared: Shared,
+    probe: Probe,
 }
 
 impl Watched {
@@ -18,24 +18,20 @@ impl Watched {
 
 pub struct Monitor {
     hosts: Vec<Watched>,
-    children: Children,
-    stop: Arc<AtomicBool>,
 }
 
 impl Monitor {
     /// Starts one probe per named machine; each reconnects on its own until the monitor drops.
     pub fn start(hosts: impl IntoIterator<Item = (String, Target)>) -> Self {
-        let children: Children = Arc::new(Mutex::new(Vec::new()));
-        let stop = Arc::new(AtomicBool::new(false));
         let hosts = hosts
             .into_iter()
             .map(|(name, target)| {
                 let shared: Shared = Arc::new(Mutex::new(Reading::default()));
-                probe::start(target, shared.clone(), children.clone(), stop.clone());
-                Watched { name, shared }
+                let probe = Probe::start(target, shared.clone(), probe::TIMING, probe::spawn);
+                Watched { name, shared, probe }
             })
             .collect();
-        Self { hosts, children, stop }
+        Self { hosts }
     }
 
     pub fn hosts(&self) -> &[Watched] {
@@ -49,11 +45,10 @@ impl Monitor {
 }
 
 impl Drop for Monitor {
+    /// Stops every probe at once; each waits for its own as the hosts drop.
     fn drop(&mut self) {
-        self.stop.store(true, Ordering::SeqCst);
-        for child in self.children.lock().unwrap().iter_mut() {
-            let _ = child.kill();
-            let _ = child.wait();
+        for host in &self.hosts {
+            host.probe.stop();
         }
     }
 }
