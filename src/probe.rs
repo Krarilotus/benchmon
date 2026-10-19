@@ -8,7 +8,7 @@
 use serde::{Deserialize, Serialize};
 use std::fmt;
 use std::io::{BufRead, BufReader, Write};
-use std::process::{Child, ChildStdout, Command, Stdio};
+use std::process::{Child, ChildStdin, ChildStdout, Command, Stdio};
 use std::sync::mpsc::{self, Receiver, RecvTimeoutError, Sender};
 use std::sync::{Arc, Mutex};
 use std::thread::{self, JoinHandle};
@@ -158,9 +158,16 @@ const NO_WINDOW: u32 = 0x0800_0000;
 const WINDOWS_PROBE: &str = include_str!("collectors/windows.ps1");
 const LINUX_PROBE: &str = include_str!("collectors/linux.py");
 // Keep the remote command short enough for cmd.exe's limit. The full collector
-// travels over stdin and is compiled in memory; no remote file is installed.
+// travels over stdin and is compiled in memory; no remote file is installed. A collector
+// that never arrives in full (its stdin left open by a stalled session) ends the bootstrap
+// after a minute instead of leaving it waiting on the machine for good.
 const WINDOWS_BOOTSTRAP: &str =
-    "$script = [Console]::In.ReadToEnd(); & ([ScriptBlock]::Create($script))";
+    "$in = [Console]::OpenStandardInput(); $script = New-Object IO.MemoryStream; \
+    if (-not $in.CopyToAsync($script).Wait(60000)) { exit 1 }; \
+    & ([ScriptBlock]::Create([Text.Encoding]::UTF8.GetString($script.ToArray())))";
+
+/// A started probe process and what it is to read on its stdin (its collector, over SSH).
+pub(crate) type Spawned = (Child, Vec<u8>);
 
 /// What a probe's thread waits for: a line of a connection, a connection's end, or `Stop`.
 enum Event {
@@ -182,7 +189,7 @@ impl Probe {
         target: Target,
         shared: Shared,
         timing: Timing,
-        spawn: impl Fn(&Target) -> std::io::Result<Child> + Send + 'static,
+        spawn: impl Fn(&Target) -> std::io::Result<Spawned> + Send + 'static,
     ) -> Self {
         let (events, inbox) = mpsc::channel();
         let lines = events.clone();
@@ -212,7 +219,7 @@ fn supervise(
     target: &Target,
     shared: &Shared,
     timing: Timing,
-    spawn: &dyn Fn(&Target) -> std::io::Result<Child>,
+    spawn: &dyn Fn(&Target) -> std::io::Result<Spawned>,
     lines: &Sender<Event>,
     inbox: &Receiver<Event>,
 ) -> Option<()> {
@@ -238,14 +245,20 @@ fn connect(
     target: &Target,
     shared: &Shared,
     timing: Timing,
-    spawn: &dyn Fn(&Target) -> std::io::Result<Child>,
+    spawn: &dyn Fn(&Target) -> std::io::Result<Spawned>,
     connection: u64,
     lines: &Sender<Event>,
     inbox: &Receiver<Event>,
 ) -> Option<bool> {
     set_status(shared, Status::Connecting);
     let mut process = match spawn(target) {
-        Ok(child) => Process::new(child),
+        Ok((child, input)) => {
+            let mut process = Process::new(child);
+            if let Some(stdin) = process.child.stdin.take() {
+                feed(stdin, input);
+            }
+            process
+        }
         Err(error) => {
             set_status(shared, Status::NoProbe(error.to_string()));
             return Some(false);
@@ -286,6 +299,15 @@ fn next(inbox: &Receiver<Event>, deadline: Instant) -> Option<Event> {
         // Unreachable while the probe holds a sender itself; stop all the same.
         Err(RecvTimeoutError::Disconnected) => Some(Event::Stop),
     }
+}
+
+/// Writes a probe's input and closes it, off the probe's thread: a write that stalls (a
+/// starved server behind a tunnel) cannot hold the probe past its deadline. Ending the
+/// process ends the write.
+fn feed(mut stdin: ChildStdin, input: Vec<u8>) {
+    thread::spawn(move || {
+        let _ = stdin.write_all(&input);
+    });
 }
 
 /// Forwards a probe's lines until its output closes, which ending its process does.
@@ -332,7 +354,7 @@ impl Drop for Process {
     }
 }
 
-pub(crate) fn spawn(target: &Target) -> std::io::Result<Child> {
+pub(crate) fn spawn(target: &Target) -> std::io::Result<Spawned> {
     let mut cmd = Command::new(if matches!(target, Target::Local) { "powershell" } else { "ssh" });
     match target {
         Target::Local => {
@@ -357,20 +379,12 @@ pub(crate) fn spawn(target: &Target) -> std::io::Result<Child> {
     cmd.stdin(if matches!(target, Target::Local) { Stdio::null() } else { Stdio::piped() });
     #[cfg(windows)]
     cmd.creation_flags(NO_WINDOW);
-    let mut child = cmd.spawn()?;
-    if let Some(mut stdin) = child.stdin.take() {
-        let script = match target {
-            Target::Windows(_) => WINDOWS_PROBE,
-            Target::Linux(_) => LINUX_PROBE,
-            Target::Local => unreachable!(),
-        };
-        if let Err(error) = stdin.write_all(script.replace('\r', "").as_bytes()) {
-            let _ = child.kill();
-            let _ = child.wait();
-            return Err(error);
-        }
-    }
-    Ok(child)
+    let input = match target {
+        Target::Local => "",
+        Target::Windows(_) => WINDOWS_PROBE,
+        Target::Linux(_) => LINUX_PROBE,
+    };
+    Ok((cmd.spawn()?, input.replace('\r', "").into_bytes()))
 }
 
 /// Each probe process lives in a job of its own that Windows ends, with every process the
@@ -517,14 +531,19 @@ mod tests {
         max_pause: Duration::from_millis(800),
     };
 
-    /// A fake probe: a PowerShell running `script`.
+    /// A fake probe: a PowerShell running `script`, given `input` it never reads.
     #[cfg(windows)]
-    fn fake(script: &str) -> std::io::Result<Child> {
+    fn fake_with(script: &str, input: Vec<u8>) -> std::io::Result<Spawned> {
         let mut c = Command::new("powershell");
         c.args(["-NoProfile", "-NonInteractive", "-Command", script]);
-        c.stdout(Stdio::piped()).stderr(Stdio::null()).stdin(Stdio::null());
+        c.stdout(Stdio::piped()).stderr(Stdio::null()).stdin(Stdio::piped());
         c.creation_flags(NO_WINDOW);
-        c.spawn()
+        Ok((c.spawn()?, input))
+    }
+
+    #[cfg(windows)]
+    fn fake(script: &str) -> std::io::Result<Spawned> {
+        fake_with(script, Vec::new())
     }
 
     #[cfg(windows)]
@@ -533,7 +552,7 @@ mod tests {
 
     /// Starts a probe whose `n`th attempt is `attempt(n)`; the probe and when each attempt began.
     fn probe(
-        attempt: impl Fn(usize) -> std::io::Result<Child> + Send + 'static,
+        attempt: impl Fn(usize) -> std::io::Result<Spawned> + Send + 'static,
     ) -> (Probe, Shared, Arc<Mutex<Vec<Instant>>>) {
         let shared: Shared = Arc::default();
         let attempts: Arc<Mutex<Vec<Instant>>> = Arc::default();
@@ -561,16 +580,20 @@ mod tests {
         None
     }
 
-    /// The panel stuck at CONNECTING under load: a probe that starts and then never answers, or
-    /// answers once and falls silent (a hung collector), is ended and started again.
+    /// The panel stuck at CONNECTING under load: a probe that never takes its input and never
+    /// answers (a starved server behind a tunnel), or answers once and falls silent (a hung
+    /// collector), is ended and started again.
     #[test]
     #[cfg(windows)]
     fn a_silent_probe_is_ended_and_started_again() {
-        let (_probe, shared, attempts) = probe(|n| match n {
-            0 => fake("Start-Sleep 3600"),
+        let (probe, shared, attempts) = probe(|n| match n {
+            // More input than a pipe holds, never read: writing it would block for good.
+            0 => fake_with("Start-Sleep 3600", vec![b'#'; 8 << 20]),
             1 => fake(&format!("{SAMPLE}; Start-Sleep 3600")),
             _ => fake(&format!("while ($true) {{ {SAMPLE}; Start-Sleep -Milliseconds 300 }}")),
         });
+        // Dropped only on success: a probe stuck for good would make a failing test hang.
+        let probe = std::mem::ManuallyDrop::new(probe);
         let reading = || shared.lock().unwrap().clone();
         let count = || attempts.lock().unwrap().len();
 
@@ -584,6 +607,7 @@ mod tests {
         })
         .expect("the silent probe was replaced and fresh samples arrive");
         assert_eq!(count(), 3);
+        drop(std::mem::ManuallyDrop::into_inner(probe));
     }
 
     #[test]
